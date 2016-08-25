@@ -51,6 +51,11 @@
 #include <ctype.h>
 #include <poll.h>
 
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <netdb.h>
+
+
 #ifdef HAVE_CONFIG_H
 # include "config.h"
 #endif
@@ -70,6 +75,7 @@
  * otherwise you will not get your keypad working.
  */
 
+#define IS_TWATCH	(p->MtxOrb_type == TWATCH)
 #define IS_LCD_DISPLAY	(p->MtxOrb_type == MTXORB_LCD)
 #define IS_LKD_DISPLAY	(p->MtxOrb_type == MTXORB_LKD)
 #define IS_VFD_DISPLAY	(p->MtxOrb_type == MTXORB_VFD)
@@ -97,7 +103,8 @@ typedef enum {
 	MTXORB_LCD,
 	MTXORB_LKD,
 	MTXORB_VFD,
-	MTXORB_VKD
+	MTXORB_VKD,
+	TWATCH
 } MtxOrb_type_type;
 
 
@@ -122,6 +129,11 @@ typedef struct MtxOrb_private_data {
 
 	int output_state;	/**< current output state */
 	int contrast;		/**< current contrast */
+	int cursor_state;
+	int x_state;
+	int y_state;
+	int brightness_state;
+	unsigned char cc_state[NUM_CCs][LCD_DEFAULT_CELLHEIGHT];
 	int brightness;
 	int offbrightness;
 	int adjustable_backlight;
@@ -335,6 +347,8 @@ MtxOrb_init (Driver *drvthis)
 		p->MtxOrb_type = MTXORB_VFD;
 	} else if (strncasecmp(buf, "vkd", 3) == 0) {
 		p->MtxOrb_type = MTXORB_VKD;
+	} else if (strncasecmp(buf, "twatch", 3) == 0) {
+		p->MtxOrb_type = TWATCH;
 	} else {
 		report(RPT_ERR, "%s: unknown display Type %s; must be one of lcd, lkd, vfd, or vkd",
 				drvthis->name, buf);
@@ -383,6 +397,9 @@ MtxOrb_init (Driver *drvthis)
 	}
 	/* End of config file parsing */
 
+	int network = (strchr(device,':')!=NULL);
+
+	if (!network) {
 	/* Set up io port correctly, and open it... */
 	p->fd = open(device, O_RDWR | O_NOCTTY);
 	if (p->fd == -1) {
@@ -421,7 +438,28 @@ MtxOrb_init (Driver *drvthis)
 		report(RPT_ERR, "%s: failed to configure port (%s)", drvthis->name, strerror(errno));
 		return -1;
 	}
+	} else {
+		/* this is a network connection */
+		struct sockaddr_in sa;
+		char * s;
+		unsigned int port;
 
+		s = strchr(device,':');
+		*s++=0;
+		port = atoi(s);
+
+		sa.sin_family = AF_INET;
+		sa.sin_port = htons(port);
+		sa.sin_addr.s_addr = inet_addr(device);
+
+		p->fd = socket(AF_INET,SOCK_STREAM,6);
+		if (connect(p->fd,&sa,sizeof(sa)) == -1) {
+			report(RPT_ERR, "%s: open network(%s:%i) failed (%s)", drvthis->name, device, port, strerror(errno));
+			return -1;
+		}
+		report(RPT_INFO, "%s: opened network display on %s:%i", drvthis->name, device, port);
+
+	}
 
 	/* Make sure the frame buffer is there... */
 	p->framebuf = (unsigned char *) calloc(p->width * p->height, 1);
@@ -430,6 +468,8 @@ MtxOrb_init (Driver *drvthis)
 		return -1;
 	}
 	memset(p->framebuf, ' ', p->width * p->height);
+
+	memset(p->cc_state,0,sizeof(p->cc_state));
 
 	/* make sure the framebuffer backing store is there... */
 	p->backingstore = (unsigned char *) malloc(p->width * p->height);
@@ -441,13 +481,21 @@ MtxOrb_init (Driver *drvthis)
 
 	/* set initial LCD configuration */
 	MtxOrb_hardware_clear(drvthis);
+	if (p->MtxOrb_type != TWATCH) {
 	MtxOrb_linewrap(drvthis, DEFAULT_LINEWRAP);
 	MtxOrb_autoscroll(drvthis, DEFAULT_AUTOSCROLL);
 	MtxOrb_cursorblink(drvthis, DEFAULT_CURSORBLINK);
 	MtxOrb_set_contrast(drvthis, p->contrast);
-	MtxOrb_backlight(drvthis, DEFAULT_BACKLIGHT);
 	MtxOrb_get_info(drvthis);
+	}
+	p->brightness_state = -1;
+	MtxOrb_backlight(drvthis, DEFAULT_BACKLIGHT);
 	report(RPT_INFO, "Display detected: %s", p->info);
+
+	p->cursor_state = -1; /* guess */
+	p->x_state = -1;
+	p->y_state = -1;
+	MtxOrb_cursor (drvthis, 1, 1, CURSOR_OFF);
 
 	report(RPT_DEBUG, "%s: init() done", drvthis->name);
 
@@ -786,6 +834,9 @@ MtxOrb_backlight (Driver *drvthis, int on)
 		int promille = (on == BACKLIGHT_ON)
 				     ? p->brightness
 				     : p->offbrightness;
+		if (p->brightness_state == promille) {
+			return;
+		}
 
 		if (IS_VKD_DISPLAY) {
 			unsigned char out[5] = { '\xFE', 'Y', 0 };
@@ -796,13 +847,15 @@ MtxOrb_backlight (Driver *drvthis, int on)
 			write(p->fd, out, 3);
 		}
 		else {
-			unsigned char out[5] = { '\xFE', '\x99', 0 };
+			unsigned char out[5] = { '\xFE', '\x98', 0 };
 
 			/* map range [0, 1000] -> [0, 255] that the hardware understands */
 			out[2] = (unsigned char) ((long) promille * 255 / 1000);
 
 			write(p->fd, out, 3);
 		}
+
+		p->brightness_state = promille;
 
 		debug(RPT_DEBUG, "MtxOrb: changed brightness to %d", promille);
 	}
@@ -837,7 +890,10 @@ MtxOrb_output (Driver *drvthis, int state)
 
 	debug(RPT_DEBUG, "MtxOrb: output pins set: %04X", state);
 
-	if (IS_LCD_DISPLAY || IS_VFD_DISPLAY) {
+	if (IS_TWATCH) {
+		/* no GPIOs! */
+		1;
+	} else  if (IS_LCD_DISPLAY || IS_VFD_DISPLAY) {
 		/* LCD and VFD displays only have one output port */
 		out[1] = (state) ? 'W' : 'V';
 		write(p->fd, out, 2);
@@ -868,6 +924,15 @@ MtxOrb_hardware_clear (Driver *drvthis)
 	PrivateData *p = drvthis->private_data;
 
 	write(p->fd, "\xFE" "X", 2);
+	if (p->MtxOrb_type == TWATCH) {
+		write(p->fd,"\xFE" "G" "\1" "\1",4);
+		write(p->fd,"                    ",20);
+		write(p->fd,"                    ",20);
+		write(p->fd,"                    ",20);
+		write(p->fd,"                    ",20);
+		/* second goto is paranoia */
+		write(p->fd,"\xFE" "G" "\1" "\1",4);
+	}
 
 	debug(RPT_DEBUG, "MtxOrb: cleared LCD");
 }
@@ -941,12 +1006,22 @@ MtxOrb_cursor_goto(Driver *drvthis, int x, int y)
 	PrivateData *p = drvthis->private_data;
 	unsigned char out[5] = { '\xFE', 'G', 0, 0 };
 
+#if 0
+	/* if it is the same as the cached position, do nothing */
+	if (x==p->x_state && y==p->y_state) {
+		return;
+	}
+#endif
+
 	/* set cursor position */
 	if ((x > 0) && (x <= p->width))
 		out[2] = (unsigned char) x;
 	if ((y > 0) && (y <= p->height))
 		out[3] = (unsigned char) y;
 	write(p->fd, out, 4);
+
+	p->x_state=x;
+	p->y_state=y;
 }
 
 
@@ -1211,6 +1286,7 @@ MtxOrb_set_char (Driver *drvthis, int n, unsigned char *dat)
 	unsigned char out[12] = { '\xFE', 'N', 0, 0,0,0,0,0,0,0,0 };
 	unsigned char mask = (1 << p->cellwidth) - 1;
 	int row;
+	int modified = 0;
 
 	if ((n < 0) || (n >= NUM_CCs))
 		return;
@@ -1221,8 +1297,14 @@ MtxOrb_set_char (Driver *drvthis, int n, unsigned char *dat)
 
 	for (row = 0; row < p->cellheight; row++) {
 		out[row+3] = dat[row] & mask;
+//		if (out[row+3] != p->cc_state[n][row]) {
+			modified=1;
+//			p->cc_state[n][row] = out[row+3];
+//		}
 	}
-	write(p->fd, out, 11);
+	if (modified) {
+		write(p->fd, out, 11);
+	}
 }
 
 
@@ -1418,6 +1500,7 @@ MtxOrb_cursor (Driver *drvthis, int x, int y, int state)
 {
 	PrivateData *p = (PrivateData *) drvthis->private_data;
 
+	if (state != p->cursor_state) {
 	/* set cursor state */
 	switch (state) {
 		case CURSOR_OFF:	/* no cursor */
@@ -1429,6 +1512,8 @@ MtxOrb_cursor (Driver *drvthis, int x, int y, int state)
 		default:
 			write(p->fd, "\xFE" "J", 2);
 			break;
+	}
+	p->cursor_state = state;
 	}
 
 	/* set cursor position */
